@@ -1,0 +1,138 @@
+# Standalone Compose file for deployments where MySQL runs OUTSIDE Docker - e.g. a
+# VPS with MySQL already installed on the host, or a managed/remote MySQL instance.
+# Only `app` and `redis` run in containers here.
+#
+# This is NOT a merge-override of compose.yaml (Compose overrides can add/replace
+# fields on a service, but cannot remove a service defined in the base file - so
+# `-f compose.yaml -f compose.external-db.yaml` would still start `mysql`). This file
+# intentionally duplicates the `app`/`redis` definitions instead, so `mysql` never
+# gets started at all.
+#
+# Usage:
+#   cp .env.example .env
+#   # set DB_HOST to reach MySQL on the host - see below - and fill in DB_USERNAME/
+#   # DB_PASSWORD/REDIS_PASSWORD/JWT_SECRET/AES_SECRET as usual
+#   docker compose -f compose.external-db.yaml up -d --build
+#
+# Reaching MySQL on the host from inside the container:
+#   - DB_HOST=host.docker.internal (resolved via the extra_hosts entry below -
+#     works on Docker 20.10+ on Linux, which covers essentially any current VPS)
+#   - or DB_HOST=<the VPS's actual private/LAN IP>
+# Either way, MySQL on the host must:
+#   - listen on an interface reachable from containers, not only 127.0.0.1
+#     (bind-address=0.0.0.0, or at least the docker0 bridge address)
+#   - grant the app's DB user access from the Docker bridge subnet
+#     (typically 172.17.0.0/16), not just 'localhost'
+#   - have its port open through any host firewall for that subnet
+#
+# Flyway (run by the app on startup) still owns schema creation/migration - point
+# DB_NAME at an empty database the very first time, same as the containerized-MySQL
+# setup in compose.yaml.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      DB_HOST: ${DB_HOST:?DB_HOST is required - e.g. host.docker.internal or the host's private IP}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_NAME: ${DB_NAME:-core}
+      DB_USERNAME: ${DB_USERNAME:?DB_USERNAME is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      AES_SECRET: ${AES_SECRET:?AES_SECRET is required}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN:-localhost}
+      SESSION_TIMEOUT: ${SESSION_TIMEOUT:-30m}
+      SESSION_COOKIE_NAME: ${SESSION_COOKIE_NAME:-GHDSESSION}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SESSION_COOKIE_SAME_SITE: ${SESSION_COOKIE_SAME_SITE:-lax}
+      MAIL_USERNAME: ${MAIL_USERNAME:-}
+      MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:19092
+      UPLOAD_PATH: /app/uploads
+      SEO_STATIC_PATH: /app/seo
+      LOG_PATH: /app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - uploads_data:/app/uploads
+      - seo_data:/app/seo
+      - logs_data:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/actuator/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - ghd-net
+
+  redis:
+    image: redis:7.4.10-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    entrypoint: ["sh", "-c", "redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - ghd-net
+
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:19093,PLAINTEXT_HOST://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:19093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    networks:
+      - ghd-net
+
+volumes:
+  redis_data:
+  uploads_data:
+  seo_data:
+  logs_data:
+  kafka_data:
+
+networks:
+  ghd-net:
+    driver: bridge
